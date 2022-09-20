@@ -6,7 +6,7 @@ extern crate osdu_rust;
 async fn main() {
 
     let access_token = "";
-   let base_url = "https://datagumbo.osdu.dev";
+   let base_url = "";
    let client = osdu_rust::client::SimpleClient::new(access_token, base_url);
    let response = client.storage.get_record("osdu:dataset--File.Generic:Afe1234").await;
    println!("{:?}", response);
