@@ -2,21 +2,38 @@ use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use aws_config;
+use aws_sdk_ssm;
+use aws_sdk_secretsmanager;
+use base64;
 
-pub struct SimpleClient {
+
+
+pub struct Client {
     pub storage: StorageService
     // pub search: SearchService
     //pub dataset: DatasetService
     //...
 }
 
-impl SimpleClient {
-    pub fn new(access_token: &str, base_api_url: &str) -> SimpleClient {
-        SimpleClient {
+impl Client {
+    // create a new simple osdu client by passing in the access token
+    pub fn simple(access_token: &str, base_api_url: &str) -> Client {
+        Client {
            storage: StorageService::new(base_api_url, access_token)
         }
     }
+    // create a new aws service principal client, it gets a token from the service principal
+    pub async fn aws_service_principal(base_api_url: &str, resource_prefix: &str, profile: &str, region: &'static str) -> Client {
+        let token_response: TokenResponse = get_svp_token(profile, resource_prefix, region).await;
+
+        Client {
+            storage: StorageService::new(base_api_url, &token_response.access_token)
+        }
+    }
+
 }
+
 
 pub struct StorageService {
     pub service_path: String,
@@ -113,4 +130,65 @@ fn get_url_params(param: Param) -> String {
     }
 }
 
-// How to represent a "record" in Rust? 
+// stuff for service principal client
+
+async fn get_svp_token(profile: &str, resource_prefix: &str, region: &'static str) -> TokenResponse {
+    let token_url_ssm_path = format!("/osdu/{resource_prefix}/oauth-token-uri");
+    let aws_oauth_custom_scope_ssm_path = format!("/osdu/{resource_prefix}/oauth-custom-scope");
+    let client_id_ssm_path = format!("/osdu/{resource_prefix}/client-credentials-client-id");
+    let client_secret_name = format!("/osdu/{resource_prefix}/client_credentials_secret");
+    
+    let config = aws_config::from_env()
+    .credentials_provider(
+        aws_config::profile::ProfileFileCredentialsProvider::builder()
+        .profile_name(profile)
+        .build()
+    )
+    .region(region)
+    .load()
+    .await;
+
+    let client_id = get_parameter(&config, &client_id_ssm_path).await;
+    let token_url = get_parameter(&config, &token_url_ssm_path).await;
+    let aws_oauth_custom_scope = get_parameter(&config, &aws_oauth_custom_scope_ssm_path).await;
+    let client_secret = get_secret(&config, &client_secret_name).await;
+
+    let auth = format!("{client_id}:{client_secret}");
+    println!("{}", auth);
+    let encoded_auth = base64::encode(auth);
+
+    let token_url = format!("{token_url}?grant_type=client_credentials&client_id={client_id}&scope={aws_oauth_custom_scope}");
+
+    let client = reqwest::Client::new();
+    let response = client.post(token_url)
+        .header("AUTHORIZATION", format!("Basic {encoded_auth}"))
+        .header("CONTENT-TYPE", "application/x-www-form-urlencoded")
+        .send()
+        .await
+        .unwrap();
+        println!{"{}", response.status()};
+        response.json::<TokenResponse>().await.unwrap()
+}
+
+ async fn get_parameter(config: &aws_config::SdkConfig, param_name: &str) -> String {
+    let client = aws_sdk_ssm::Client::new(&config);
+    let builder = client.get_parameter();
+    let resp = builder.name(param_name).send().await.unwrap();
+    let parameter = resp.parameter().unwrap().value().unwrap();
+    parameter.to_string()
+}
+
+async fn get_secret(config: &aws_config::SdkConfig, secret_name: &str) -> String {
+    let client = aws_sdk_secretsmanager::Client::new(&config);
+    let resp = client.get_secret_value().secret_id(secret_name).send().await.unwrap();
+    let secret = resp.secret_string().unwrap();
+    let object = serde_json::from_str::<HashMap<String,String>>(secret).unwrap();
+    let stringvalue = object.get("client_credentials_client_secret").unwrap();
+    stringvalue.to_string()
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TokenResponse {
+    access_token: String,
+    expires_in: i32
+}
